@@ -3,4 +3,4 @@ python-dotenv
 Pillow
 requests
 yt-dlp
-PySide6
+streamlit

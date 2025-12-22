@@ -1,19 +1,12 @@
 import os
 import spotipy
-import datetime
 import random
-import base64
-import requests
-import io
 import csv
-import re # Added for YouTube title cleanup
-from PIL import Image
+import re
 from difflib import SequenceMatcher
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
-
-# PySide6 components for safe threading communication
-from PySide6.QtCore import QObject, Signal, QRunnable
+import requests
 
 # Try importing yt_dlp
 try:
@@ -33,63 +26,78 @@ SCOPE = "playlist-modify-private playlist-modify-public playlist-read-private ug
 MATCH_THRESHOLD = 0.4
 
 class SpotifyBot:
-    # Constructor updated to only expect signals, as this file is now PySide6-exclusive
-    def __init__(self, signals):
-        self.signals = signals
+    def __init__(self, log_callback=None):
+        """
+        :param log_callback: A function that accepts a string message (e.g., st.write or print)
+        """
+        self.log_callback = log_callback
         self.sp = self.authenticate()
-        # Only proceed if authentication was successful
         if self.sp:
-            self.user_id = self.sp.current_user()['id']
-            self.log("✅ Spotify authenticated.")
+            try:
+                self.user_id = self.sp.current_user()['id']
+                self.log("✅ Spotify authenticated.")
+            except Exception as e:
+                self.log(f"❌ Auth Error: {e}")
+                self.sp = None
 
     def log(self, message):
-        """Emits message to the GUI via the log signal."""
-        # Use .emit() for the PySide6 Signal object
-        self.signals.log_message.emit(message + "\n")
+        """Sends message to the callback if it exists."""
+        if self.log_callback:
+            self.log_callback(message)
+        else:
+            print(message)
 
     def authenticate(self):
-        # PROXY FIX: Ignore system proxies
         session = requests.Session()
         session.trust_env = False
         
         try:
+            # open_browser=False is crucial for Streamlit Cloud to prevent hanging
             return spotipy.Spotify(auth_manager=SpotifyOAuth(
                 client_id=CLIENT_ID,
                 client_secret=CLIENT_SECRET,
                 redirect_uri=REDIRECT_URI,
                 scope=SCOPE,
-                cache_path=".spotify_cache"
+                cache_path=".spotify_cache",
+                open_browser=False 
             ), requests_session=session)
         except Exception as e:
             self.log(f"FATAL AUTH ERROR: {str(e)}")
-            return None # Return None if authentication fails
+            return None 
 
-    # --- NEW: PARSING METHODS (Moved from CreateWorker and added) ---
-    def parse_csv(self, file_path):
+    def parse_csv(self, file_object):
+        """
+        Parses an uploaded file object (Streamlit UploadedFile) or local path.
+        """
         songs = []
         try:
-            self.log(f"Loading songs from file: {file_path}")
-            
-            # Read content to check format
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Simple heuristic for CSV/TXT
-            if ',' in content and len(content.split('\n')[0].split(',')) > 1:
-                # Treat as CSV, assume song name is in the first column
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        if row:
-                            songs.append(row[0].strip())
+            # Check if it's a Streamlit UploadedFile (has 'read' attribute) or string path
+            if hasattr(file_object, 'read'):
+                # Reset pointer and decode
+                file_object.seek(0)
+                content = file_object.read().decode('utf-8')
+                name = getattr(file_object, 'name', 'Uploaded File')
             else:
-                # Treat as a simple list, one song per line
+                with open(file_object, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                name = file_object
+
+            self.log(f"Loading songs from: {name}")
+
+            # Heuristic: if comma in first line, treat as CSV
+            if ',' in content and len(content.split('\n')[0].split(',')) > 1:
+                reader = csv.reader(content.splitlines())
+                for row in reader:
+                    if row:
+                        songs.append(row[0].strip())
+            else:
+                # Treat as line-by-line list
                 songs = [line.strip() for line in content.splitlines() if line.strip()]
 
             self.log(f"Successfully loaded {len(songs)} items.")
             return songs
         except Exception as e:
-            self.log(f"❌ Error parsing file {file_path}: {e}")
+            self.log(f"❌ Error parsing file: {e}")
             return []
 
     def parse_youtube(self, url):
@@ -111,7 +119,6 @@ class SpotifyBot:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(url, download=False)
 
-            # Handle playlists and single videos
             entries = info_dict.get('entries', [info_dict] if 'title' in info_dict else [])
             
             if 'entries' in info_dict:
@@ -119,7 +126,6 @@ class SpotifyBot:
 
             for entry in entries:
                 if entry and 'title' in entry:
-                    # Clean the title: remove content in parentheses/brackets (e.g., [Official Video])
                     title = entry['title']
                     title = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', title).strip()
                     songs.append(title)
@@ -135,19 +141,20 @@ class SpotifyBot:
             self.log(f"❌ Error fetching YouTube data: {e}")
             return []
 
-
-    # --- DE-DUPLICATOR ---
     def deduplicate_playlist(self, playlist_url):
         try:
-            # Check if authentication failed before fetching
             if not self.sp:
                 self.log("❌ Cannot run deduplication: Spotify not authenticated.")
                 return
 
-            playlist_id = playlist_url.split("/")[-1].split("?")[0]
-            self.log(f"🔎 Scanning playlist: {playlist_id}...")
+            # Extract ID more robustly
+            if "playlist/" in playlist_url:
+                playlist_id = playlist_url.split("playlist/")[1].split("?")[0]
+            else:
+                playlist_id = playlist_url
+
+            self.log(f"🔎 Scanning playlist ID: {playlist_id}...")
             
-            # Fetch all tracks
             results = self.sp.playlist_items(playlist_id)
             tracks = results['items']
             while results['next']:
@@ -158,10 +165,9 @@ class SpotifyBot:
             to_remove = []
             
             for i, item in enumerate(tracks):
-                if item['track'] and item['track']['id']:
+                if item.get('track') and item['track'].get('id'):
                     tid = item['track']['id']
                     if tid in seen_ids:
-                        # Found duplicate! Append the specific occurrence (position i)
                         to_remove.append({
                             "uri": item['track']['uri'],
                             "positions": [i] 
@@ -172,7 +178,6 @@ class SpotifyBot:
 
             if to_remove:
                 self.log(f"🧹 Found {len(to_remove)} duplicates. Removing...")
-                # Remove in batches of 100
                 for i in range(0, len(to_remove), 100):
                     batch = to_remove[i:i+100]
                     self.sp.playlist_remove_specific_occurrences_of_items(playlist_id, batch)
@@ -182,11 +187,7 @@ class SpotifyBot:
                 
         except Exception as e:
             self.log(f"❌ Error during deduplication: {str(e)}")
-        finally:
-            self.signals.finished.emit()
 
-
-    # --- CREATOR LOGIC ---
     def validate_match(self, query, track_obj):
         found_str = f"{track_obj['artists'][0]['name']} {track_obj['name']}".lower()
         clean_query = query.lower().replace("track:", "").replace("artist:", "")
@@ -194,10 +195,8 @@ class SpotifyBot:
         return (True, found_str) if ratio >= MATCH_THRESHOLD else (False, f"{found_str} ({ratio:.2f})")
 
     def create_playlist_from_list(self, song_list, playlist_name):
-        # Check if authentication failed before running search
         if not self.sp:
             self.log("❌ Cannot create playlist: Spotify not authenticated.")
-            self.signals.finished.emit()
             return
 
         valid_ids = []
@@ -205,9 +204,10 @@ class SpotifyBot:
         
         self.log(f"🔎 Processing {len(song_list)} songs...")
         
+        # Streamlit progress bar handling could go here, but logging is safer
         for query in song_list:
             try:
-                self.log(f"Searching: {query}...")
+                # Simple sleep or check to avoid rate limits could be added here
                 res = self.sp.search(q=query, limit=1, type='track')
                 if res['tracks']['items']:
                     track = res['tracks']['items'][0]
@@ -216,8 +216,10 @@ class SpotifyBot:
                         valid_ids.append(track['id'])
                         self.log(f"   -> Found: {found_name}")
                     else:
+                        self.log(f"   -> Weak Match (Skipped): {query} vs {found_name}")
                         missing.append(query)
                 else:
+                    self.log(f"   -> Not found: {query}")
                     missing.append(query)
             except Exception as e:
                 self.log(f"Error searching {query}: {e}")
@@ -225,81 +227,39 @@ class SpotifyBot:
 
         if not valid_ids:
             self.log("❌ No valid tracks found.")
-            self.signals.finished.emit()
             return
 
-        # Apply recommender if list is short
-        if len(valid_ids) < 10 and len(valid_ids) > 0:
+        if 0 < len(valid_ids) < 10:
             valid_ids = self.extend_playlist(valid_ids, target_size=20)
 
-        # Create Playlist
-        desc = f"Generated by Spotify Studio Pro 🐍 | {len(valid_ids)} Tracks"
-        pl = self.sp.user_playlist_create(self.user_id, playlist_name, public=False, description=desc)
+        try:
+            desc = f"Generated by Spotify Studio Pro 🐍 | {len(valid_ids)} Tracks"
+            pl = self.sp.user_playlist_create(self.user_id, playlist_name, public=False, description=desc)
+            
+            uris = [f"spotify:track:{tid}" for tid in valid_ids]
+            for i in range(0, len(uris), 100):
+                self.sp.playlist_add_items(pl['id'], uris[i:i+100])
+            
+            self.log(f"🚀 Success! Created '{playlist_name}' with {len(uris)} songs.")
+            self.log(f"🔗 Link: {pl['external_urls']['spotify']}")
+        except Exception as e:
+            self.log(f"❌ Error creating playlist: {e}")
         
-        # Add Tracks
-        uris = [f"spotify:track:{tid}" for tid in valid_ids]
-        for i in range(0, len(uris), 100):
-            self.sp.playlist_add_items(pl['id'], uris[i:i+100])
-        
-        self.log(f"🚀 Success! Created '{playlist_name}' with {len(uris)} songs. URL: {pl['external_urls']['spotify']}")
-        
-        # Handle Missing
         if missing:
-            try:
-                with open("missing_songs.txt", "w", encoding='utf-8') as f:
-                    f.write("\n".join(missing))
-                self.log(f"⚠️ {len(missing)} missing songs saved to missing_songs.txt")
-            except Exception as e:
-                 self.log(f"⚠️ Could not save missing songs file: {e}")
-        
-        self.signals.finished.emit()
+            self.log(f"⚠️ {len(missing)} missing songs.")
+            # We can return this list or handle it in the UI
+            return missing
 
     def extend_playlist(self, track_ids, target_size=20):
         if len(track_ids) >= target_size: return track_ids
         self.log(f"✨ Extending playlist from {len(track_ids)} to {target_size} songs...")
         needed = target_size - len(track_ids)
-        # Use random sample up to 5 tracks as seeds
         seeds = random.sample(track_ids, min(5, len(track_ids)))
-        recs = self.sp.recommendations(seed_tracks=seeds, limit=needed)
-        new_ids = [t['id'] for t in recs['tracks']]
-        self.log(f"   -> Added {len(new_ids)} recommended tracks.")
-        return track_ids + new_ids
-
-
-    # --- WORKER CLASSES (for threading) ---
-
-class WorkerSignals(QObject):
-    """Defines the signals available from a running worker thread."""
-    finished = Signal()
-    log_message = Signal(str)
-
-class CreateWorker(QRunnable):
-    """Worker for the playlist creation process."""
-    def __init__(self, bot, source, playlist_name):
-        super().__init__()
-        self.bot = bot
-        self.source = source # Stores the file path or URL
-        self.playlist_name = playlist_name
-
-    def run(self):
-        # Determine input source and call the new parsing methods on the bot
-        if self.source.startswith(("http", "https")):
-            songs = self.bot.parse_youtube(self.source)
-        elif self.source.endswith(('.csv', '.txt')) or os.path.exists(self.source):
-            songs = self.bot.parse_csv(self.source)
-        else:
-            self.bot.log(f"❌ Error: Invalid input source or file not found: {self.source}")
-            self.bot.signals.finished.emit()
-            return
-            
-        self.bot.create_playlist_from_list(songs, self.playlist_name)
-
-class DedupeWorker(QRunnable):
-    """Worker for the deduplication process."""
-    def __init__(self, bot, playlist_url):
-        super().__init__()
-        self.bot = bot
-        self.playlist_url = playlist_url
-
-    def run(self):
-        self.bot.deduplicate_playlist(self.playlist_url)
+        try:
+            recs = self.sp.recommendations(seed_tracks=seeds, limit=needed)
+            new_ids = [t['id'] for t in recs['tracks']]
+            self.log(f"   -> Added {len(new_ids)} recommended tracks.")
+            return track_ids + new_ids
+        except Exception as e:
+            self.log(f"Error extending playlist: {e}")
+            return track_ids
